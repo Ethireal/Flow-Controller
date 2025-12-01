@@ -1,0 +1,28 @@
+{
+    "frameEnd": "*/",
+    "frameStart": "/*",
+    "groups": [
+        {
+            "datasets": [
+                {
+                    "alarm": 200,
+                    "fft": false,
+                    "fftSamples": 1024,
+                    "graph": true,
+                    "led": false,
+                    "log": false,
+                    "max": 200,
+                    "min": 0,
+                    "title": "Flow Sensor",
+                    "units": "LPM",
+                    "value": "%1",
+                    "widget": ""
+                }
+            ],
+            "title": "Motor Flow Sensor",
+            "widget": ""
+        }
+    ],
+    "separator": ",",
+    "title": "Flow_Controller"
+}
