@@ -17,6 +17,20 @@
                     "units": "LPM",
                     "value": "%1",
                     "widget": ""
+                },
+                {
+                    "alarm": 100,
+                    "fft": false,
+                    "fftSamples": 1024,
+                    "graph": true,
+                    "led": false,
+                    "log": false,
+                    "max": 100,
+                    "min": 0,
+                    "title": "Frequency",
+                    "units": "Hz",
+                    "value": "%2",
+                    "widget": ""
                 }
             ],
             "title": "Motor Flow Sensor",

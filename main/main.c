@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include "esp_system.h"
 #include "esp_intr_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,6 +15,11 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdmmc_host.h"
+#include "driver/sdmmc_defs.h"
+#include "driver/sdmmc_types.h"
 #include "driver/spi_common.h"
 #include "esp_lvgl_port.h"
 
@@ -25,7 +31,7 @@
 #define UART_RX_PIN GPIO_NUM_3
 
 // <<-- GPIO PIN DEFINITIONS -->>
-#define GPIO_LED GPIO_NUM_2
+#define GPIO_LED GPIO_NUM_27
 #define GPIO_FLOW GPIO_NUM_25
 #define ESP_INTR_FLAG_DEFAULT 0
 #define GPIO_OUTPUT_PIN_SEL (1ULL<<GPIO_LED)
@@ -37,13 +43,13 @@
 #define DISPLAY_CS GPIO_NUM_5
 #define DISPLAY_DC GPIO_NUM_22
 #define DISPLAY_RST GPIO_NUM_21
-#define DISPLAY_BL GPIO_NUM_4
+#define DISPLAY_BL GPIO_NUM_26
 
 #define DISPLAY_HEIGHT 320
 #define DISPLAY_WIDTH 240
 
 // <<-- PULSE CONTROL DEFINTIONS -->>
-#define NUM_MODES 3
+#define PWM_NUM_MODES 3
 #define MAX_FLOW 100
 #define PWM_FREQ 150
 #define PWM_GPIO GPIO_NUM_32
@@ -55,13 +61,41 @@
 
 // <<-- FLOW CONTROL DEFINITIONS -->>
 #define FLOW_BUFF_SIZE 20
-#define FLOW_PERIOD_MS 150
+#define FLOW_OUTPUT_BUFF_SIZE 20
+#define FLOW_OUTPUT_PERIOD_MS 200
 #define FLOW_DEFAULT_BUFFER_VAL pdMS_TO_TICKS(1200) //UINT32_MAX
 #define FLOW_DEBOUNCE 5
-#define FLOW_K_VALUE 0.5
+#define FLOW_K_VALUE 0.26
+#define FLOW_PULSE_TIMEOUT 1000
+
+// <<-- DATA SAVING DEFINITIONS -->>
+#define DATA_GPIO_CMD GPIO_NUM_15
+#define DATA_GPIO_CLK GPIO_NUM_14
+#define DATA_GPIO_D0 GPIO_NUM_2
+#define DATA_GPIO_D1 GPIO_NUM_4
+#define DATA_GPIO_D2 GPIO_NUM_12
+#define DATA_GPIO_D3 GPIO_NUM_13
+#define DATA_NUM_MODES 2
 
 // <<-- SERIAL STUDIO OUTPUT DEFINITIONS -->>
 #define SERIAL_OUTPUT 1
+
+// <<-- CUSTOM TYPEDEFS -->>
+
+typedef struct  {
+    volatile float* pntrRate;
+    volatile float* pntrFreq;
+    int buffIdx;
+    float buffRate[FLOW_OUTPUT_BUFF_SIZE];
+    float buffFreq[FLOW_OUTPUT_BUFF_SIZE];
+    volatile TickType_t buffTimestamp[FLOW_OUTPUT_BUFF_SIZE];
+    volatile TickType_t flowTicks[FLOW_BUFF_SIZE];
+} flow_data_t;
+
+typedef struct {
+    volatile TickType_t period;
+    volatile TickType_t timestamp;
+} isr_time_data_t;
 
 // GLOBAL VARIABLES - GENERAL
 static const char *TAG = "PumpCtrl";
@@ -70,12 +104,25 @@ static const char *TAG = "PumpCtrl";
 static QueueHandle_t UART_event_q = NULL;
 
 // GLOBAL VARIABLES - FLOW
-static volatile TickType_t flow_last_tick = 0;
-static volatile TickType_t flow_buff[FLOW_BUFF_SIZE];
+static volatile DRAM_ATTR TickType_t flow_last_tick = 0;
+//static volatile TickType_t flow_buff[FLOW_BUFF_SIZE];
 static volatile uint8_t flow_tar = 0;
 static volatile float flowRate = 0;
+static volatile float flowFreq = 0;
 portMUX_TYPE flow_spinlock = portMUX_INITIALIZER_UNLOCKED;
 QueueHandle_t flow_event_q = NULL;
+
+flow_data_t flow_meter = {
+    .pntrRate = &flowRate,
+    .pntrFreq = &flowFreq,
+    .buffIdx = 0
+};
+
+// GLOBAL VARIABLE - DATA
+bool mountState = false;
+int dataWrite = 0;
+FILE *f;
+static const char data_label[DATA_NUM_MODES][20] = {"Off","On"};
 
 // GLOBAL VARIABLES - LCD
 esp_lcd_panel_handle_t disp_handle;
@@ -87,15 +134,20 @@ lv_obj_t *init_Label;
 static uint8_t target_spd = 0;
 static uint8_t curr_spd = 0;
 static int mode = 0;
-static char mode_label[NUM_MODES][20] = {"Off","Auto","Manual"};
+static const char mode_label[PWM_NUM_MODES][20] = {"Off","Auto","Manual"};
 // static float pwm_duty = 0;
 esp_timer_handle_t auto_pwm_timer = NULL;
 
 void IRAM_ATTR flow_meter_isr(void * args){
-    TickType_t local_now_tick = xTaskGetTickCountFromISR();
-    TickType_t isr_new_time = local_now_tick-flow_last_tick;
-    if(pdTICKS_TO_MS(isr_new_time) > FLOW_DEBOUNCE){
+    
+TickType_t local_now_tick = xTaskGetTickCountFromISR();
+    TickType_t isr_new_period = local_now_tick-flow_last_tick;
+    if(pdTICKS_TO_MS(isr_new_period) > FLOW_DEBOUNCE){
         flow_last_tick = local_now_tick;
+        isr_time_data_t isr_new_time = {
+            .period = isr_new_period,
+            .timestamp = local_now_tick
+        };
         xQueueSendFromISR(flow_event_q,&isr_new_time,NULL);
     }
 }
@@ -139,6 +191,8 @@ void init_GPIO(){
     //disable pull-up mode
     io_conf.pull_up_en = 0;
     gpio_config(&io_conf);
+
+    flow_event_q = xQueueCreate(10,sizeof(isr_time_data_t));
 
     //install gpio isr service
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
@@ -251,12 +305,47 @@ void init_PWM(){
     ESP_ERROR_CHECK(ledc_channel_config(&PWM_channel));
 }
 
+void init_DATA(){
+    esp_err_t return_ERR;
+    sdmmc_card_t *SD_card;
+    const char mount_point[] = "/sdcard";
+
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.flags = SDMMC_HOST_FLAG_1BIT;
+
+    sdmmc_slot_config_t slot_config = {
+        .clk = DATA_GPIO_CLK,
+        .cmd = DATA_GPIO_CMD,
+        .d0 = DATA_GPIO_D0,
+        .width = 1,
+        .flags = 0,
+        .cd = SDMMC_SLOT_NO_CD,
+        .wp = SDMMC_SLOT_NO_WP
+    };
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+
+    return_ERR = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &SD_card);
+
+    if(return_ERR != ESP_OK){
+        ESP_LOGE(TAG,"Failed to mount filesystem: %s",esp_err_to_name(return_ERR));
+        return;
+    }
+
+    mountState = true;
+    ESP_LOGI(TAG,"Successfully mounted filesystem");
+}
+
 void init_TIMER(){
 
     // const esp_timer_create_args_t periodic_pwm_timer_args = {
     //     .callback = pwm_cb,
     //     .arg = &curr_spd,
-    //     .name = "auto_mode_pwm"
+    //     .name = "Local_Timestamp"
     // };
     // ESP_ERROR_CHECK(esp_timer_create(&periodic_pwm_timer_args, &auto_pwm_timer));
     // // ESP_LOGI(TAG, "Start motor speed loop");
@@ -270,7 +359,7 @@ void Speed2Duty(uint8_t x){
     float s = 0;
     const uint32_t pwm_res = (1U << PWM_DUTY_RES); // 2^resolution
 
-    if(x > 0 && x <= 100){
+    if(x > 0 && x <= 100){      // TODO - ADD BETTER EDGE CASES
         s = ((((float)x/100)*0.72)+0.13);
         d = (uint32_t) ((((float)x/100*0.72)+0.13)*pwm_res);
     }
@@ -299,9 +388,9 @@ void parse_cmd(char * cmd){
             } else {
                 modeN = 0;
             }
-            if (modeN < NUM_MODES && modeN >= 0){
+            if (modeN < PWM_NUM_MODES && modeN >= 0){
                 mode = modeN;
-                ESP_LOGI(TAG,"New Mode: %d",mode);
+                ESP_LOGI(TAG,"New Mode: %s",mode_label[mode]);
                 if(modeN == 0){
                     target_spd = 0;
                     Speed2Duty(target_spd);
@@ -309,6 +398,7 @@ void parse_cmd(char * cmd){
             } else {
                 ESP_LOGI(TAG,"Invalid Mode");
             }
+
         } else if (strcmp(tok,"flow") == 0){ // command "FLOW"
             tok = strtok(NULL," ");
             int speedN;
@@ -326,6 +416,43 @@ void parse_cmd(char * cmd){
             } else {
                 ESP_LOGI(TAG,"Invalid Flow Rate");
             }
+
+        }else if(strcmp(tok,"data") == 0){ // command "DATA"
+            if(mountState){
+                tok = strtok(NULL," ");
+                int dataN;
+                if(tok != NULL){
+                    dataN = atoi(tok);
+                } else {
+                    dataN = 0;
+                }
+                if(dataN < DATA_NUM_MODES && dataN >=0){
+                    if(dataN != dataWrite){
+                        switch (dataN)
+                        {
+                            case 0:
+                                fclose(f);
+                                break;
+
+                            case 1:
+                                f = fopen("/sdcard/test.txt","w");
+                                if(f == NULL){
+                                    ESP_LOGE(TAG,"Failed to open data file");
+                                    dataN = 0;
+                                }
+                                break;
+                            
+                            default:
+                                break;
+                        }
+                        dataWrite = dataN;
+                    }
+                    ESP_LOGI(TAG,"Data Write: %s",data_label[dataWrite]);
+                }
+            } else {
+                ESP_LOGE(TAG,"No mounted file system for data saving");
+            }
+
         } else {        // OTHERWISE
             ESP_LOGI(TAG,"Unrecognized Command: \"%s\"",tok);
         }
@@ -373,14 +500,12 @@ void update_disp_TASK(void * pntr){
         
         portENTER_CRITICAL(&flow_spinlock);
         float local_flow = flowRate;
+        float local_freq = flowFreq;
         portEXIT_CRITICAL(&flow_spinlock);
-        #if SERIAL_OUTPUT
-            ESP_LOGI(TAG,"/*%f*/",local_flow);
-        #endif
         lvgl_port_lock(0);
         lv_label_set_text_fmt(init_Label,
-            "Mode: %s\nTarget Motor Speed: %d%%\nCommanded Motor Speed: %d%%\n\nCurrent Flow Rate: %.2f",
-            mode_label[mode],local_tSpd,local_cSpd,local_flow);
+            "Mode: %s\nData Write: %s\nTarget Motor Speed: %d%%\nCommanded Motor Speed: %d%%\n\nCurrent Flow Rate: %.2f\nCurrent Freq: %.2f",
+            mode_label[mode],data_label[dataWrite],local_tSpd,local_cSpd,local_flow,local_freq);
         lvgl_port_unlock();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -388,50 +513,96 @@ void update_disp_TASK(void * pntr){
     // lv_obj_set_pos(init_Label, 0, 0);
 }
 
+/* Function flow_TASK()
+    fr_pntr - void pointer the the typedef holding the buffers and control data for the flow meter*/
 void flow_TASK(void * fr_pntr){
 
-    flow_event_q = xQueueCreate(10,sizeof(TickType_t));    
+    flow_data_t* local_meter = (flow_data_t*) fr_pntr;          //dereference the void pointer to access the values within the typedef
+    volatile float* pRate = local_meter->pntrRate;              //create a local pointer to the rate value for display
+    volatile float* pFreq = local_meter->pntrFreq;              //create a local pointer to the freqency value for display
+    volatile TickType_t* flow_buff = local_meter->flowTicks;    //create a local pointer to the buffer that holds the tick values returned by the ISR
     for(int i = 0; i < FLOW_BUFF_SIZE;i++){
-        flow_buff[i] = FLOW_DEFAULT_BUFFER_VAL;
+        flow_buff[i] = FLOW_DEFAULT_BUFFER_VAL;                 //Iterate thru the buffer and initiallize all the values to ignore irregular initial values
     }
 
-    TickType_t flow_new = 0;
-    float new_rate;
-    while(true){
-        if(xQueueReceive(flow_event_q,&flow_new,pdMS_TO_TICKS(1200))){
-            flow_buff[flow_tar++] = flow_new;
-            flow_tar %= FLOW_BUFF_SIZE;
-            float flow_time = 0;
+    isr_time_data_t isr_time = {
+        .period = 0,
+        .timestamp = 0,
+    };                                                          //define a typedef to hold the recieved period and timestamp from the ISR
+    TickType_t local_tNow = 0;                                  //define a local value for current tick count
+    TickType_t local_tLast = xTaskGetTickCount();               //define a second local value for tick count to compare the last one to
+    int* local_Idx = &(local_meter->buffIdx);                   //define a local pointer for the number of new measurements within the buffer
+    float new_rate;                                             //define a local value to hold calculated rate
+    float new_freq;                                             //define a local value to hold calculated frequency
+
+    while(true){        // << -- ENTER FREE-RUNNING LOOP -- >>
+        if(xQueueReceive(flow_event_q,&isr_time,pdMS_TO_TICKS(FLOW_PULSE_TIMEOUT))){    //Tell the loop to defer execution until the flow_event_q receives a value (from the flow ISR) or it hits its timeout value
+            flow_buff[flow_tar++] = isr_time.period;        //add the period sent from ISR into the buffer of values
+            flow_tar %= FLOW_BUFF_SIZE;                     //move to the next pointiton in the buffer, at the end loop back over the preivous entries
+            float flow_time = 0;                            //float to hold the mean period of all values in the buffer flow_buff
             for(int i = 0; i < FLOW_BUFF_SIZE;i++){
-                flow_time += pdTICKS_TO_MS(flow_buff[i]);
+                flow_time += pdTICKS_TO_MS(flow_buff[i]);   //interate thru every value in the buffer and add them
             }
-            flow_time /= ((float)FLOW_BUFF_SIZE*1000.0);
+            flow_time /= ((float)FLOW_BUFF_SIZE*1000.0);    //divide the sum by the total number of values
 
             //ESP_LOGI(TAG,"Running Flow: %f",flow_time);
             if (flow_time > 0){
-                //ESP_LOGI(TAG,"Flow: %f",flow_now);
                 new_rate = 1.0/(flow_time*FLOW_K_VALUE);
+                new_freq = 1.0/flow_time;
             } else {
                 new_rate = 0;
+                new_freq = 0;
             }
-        } else {
+        } else {    //ON TIMEOUT
             new_rate = 0;
+            new_freq = 0;
+            isr_time.timestamp = xTaskGetTickCount();
         }
-        portENTER_CRITICAL(&flow_spinlock);
-        *(float*)fr_pntr = new_rate;
-        portEXIT_CRITICAL(&flow_spinlock);
+        local_meter->buffRate[*local_Idx] = new_rate;
+        local_meter->buffFreq[*local_Idx] = new_freq;
+        local_meter->buffTimestamp[*local_Idx] = isr_time.timestamp;
+        *local_Idx = (*local_Idx)+1;
+        if(*local_Idx > FLOW_OUTPUT_BUFF_SIZE){
+            ESP_LOGW(TAG,"FLOW OUTPUT OVERFLOW!");
+            *local_Idx = *local_Idx % FLOW_OUTPUT_BUFF_SIZE;
+        }
+        local_tNow = xTaskGetTickCount();
+        if((local_tNow-local_tLast) > pdMS_TO_TICKS(FLOW_OUTPUT_PERIOD_MS)){
+            ESP_LOGI(TAG,"TS %lu",local_tNow);
+            #if SERIAL_OUTPUT
+                char OUT_STR[26*FLOW_OUTPUT_BUFF_SIZE+1] = "\0";
+                char LOOP_STR[26] = "\0";
+                for(int i = 0; i < *local_Idx; i++){
+                    sprintf(LOOP_STR,"/*%3.2f, %3.2f, %3lu*/\n",local_meter->buffRate[i],local_meter->buffFreq[i],local_meter->buffTimestamp[i]);
+                    strcat(OUT_STR,LOOP_STR);
+                }
+                ESP_LOGI(TAG,"%s",OUT_STR);
+            #endif
+            if(dataWrite == 1){
+                fprintf(f,"%s",OUT_STR);
+            }
+            *local_Idx = 0;
+            portENTER_CRITICAL(&flow_spinlock);
+            *pRate = new_rate;
+            *pFreq = new_freq;
+            portEXIT_CRITICAL(&flow_spinlock);
+            local_tLast = xTaskGetTickCount();
+        }
     }
     
 
 }
 
+/*Function - heartbeat_TASK()
+    pntr - unused
+a function to alternate the state of a LED to show that the Controller is operational*/
 void heartbeat_TASK(void * pntr){
 
-    bool LEDstate = 0;
-    while (true){
-        LEDstate = !LEDstate;
-        gpio_set_level(GPIO_LED,LEDstate);
-        vTaskDelay(pdMS_TO_TICKS(500));
+    bool LEDstate = 0;  //store the state of the LED
+    while (true){           // Loop forever
+        LEDstate = !LEDstate;               //invert the state
+        gpio_set_level(GPIO_LED,LEDstate);  //apply the new state
+        vTaskDelay(pdMS_TO_TICKS(500));     //wait half a second
     }
 }
 
@@ -445,11 +616,12 @@ void app_main(void){
     init_GPIO();
     init_Display();
     init_PWM();
+    init_DATA();
 
     xTaskCreate(read_input_TASK,"Read Input",4096,NULL,6,NULL);
     xTaskCreate(heartbeat_TASK,"LED Pulse",4096,NULL,3,NULL);
     xTaskCreate(update_disp_TASK,"LCD Display",4096,NULL,3,NULL);
-    xTaskCreate(flow_TASK,"Calculate Flow",4096,(void*)&flowRate,4,NULL);
+    xTaskCreate(flow_TASK,"Calculate Flow",4096,(void*)&flow_meter,4,NULL);
 
     ESP_LOGI(TAG,"Starting Echo Chamber . . .\n");
 
