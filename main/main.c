@@ -138,20 +138,24 @@ static const char mode_label[PWM_NUM_MODES][20] = {"Off","Auto","Manual"};
 // static float pwm_duty = 0;
 esp_timer_handle_t auto_pwm_timer = NULL;
 
+/**ISR routine for the flow meter that triggers on the falling edge of the flow meter pulse signal 
+ *      Function is attached within init_GPIO
+*/
 void IRAM_ATTR flow_meter_isr(void * args){
-    
-TickType_t local_now_tick = xTaskGetTickCountFromISR();
+    //use the internal esp tick count to determine time betweeen interrupts
+    TickType_t local_now_tick = xTaskGetTickCountFromISR();
     TickType_t isr_new_period = local_now_tick-flow_last_tick;
-    if(pdTICKS_TO_MS(isr_new_period) > FLOW_DEBOUNCE){
-        flow_last_tick = local_now_tick;
-        isr_time_data_t isr_new_time = {
+    if(pdTICKS_TO_MS(isr_new_period) > FLOW_DEBOUNCE){  // include a software debounce for pulses faster that flow meter can read
+        flow_last_tick = local_now_tick;    //update clast interrupt trigger
+        isr_time_data_t isr_new_time = {    //package the period and local timestamp
             .period = isr_new_period,
             .timestamp = local_now_tick
         };
-        xQueueSendFromISR(flow_event_q,&isr_new_time,NULL);
+        xQueueSendFromISR(flow_event_q,&isr_new_time,NULL); //send the packaged data to a queue to be processes outside the ISR
     }
 }
 
+// initialization function for UART, sets properties for displaying to the console.
 void init_UART(){
     ESP_ERROR_CHECK(uart_driver_install(UART_PORT,UART_BUFF_SZ,UART_BUFF_SZ,UART_QUEUE_SZ,&UART_event_q,0));
 
@@ -166,6 +170,7 @@ void init_UART(){
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT,UART_TX_PIN,UART_RX_PIN,UART_PIN_NO_CHANGE,UART_PIN_NO_CHANGE));
 }
 
+// initialization function for the GPIO pins (LED Heartbeat and Flowmeter)
 void init_GPIO(){
     //zero-initialize the config structure
     gpio_config_t io_conf = {};
@@ -200,10 +205,11 @@ void init_GPIO(){
     gpio_isr_handler_add(GPIO_FLOW, flow_meter_isr, NULL);
 }
 
+// initialize the LCD to communicate over SPI
 void init_Display(){
 
     gpio_set_direction(DISPLAY_DC, GPIO_MODE_OUTPUT);
-
+    //set up the SPI communication
     spi_bus_config_t bus_config = {
         .mosi_io_num = DISPLAY_MOSI,
         .miso_io_num = -1,
@@ -235,15 +241,16 @@ void init_Display(){
         .color_space = ESP_LCD_COLOR_SPACE_RGB,
         .bits_per_pixel = 16
     };
-
+    //create teh dispaly to write to
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io, &panel_config, &disp_handle));
-
+    //reset and turn on the panel
     ESP_ERROR_CHECK(esp_lcd_panel_reset(disp_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(disp_handle));
 
     gpio_set_direction(DISPLAY_DC, GPIO_MODE_OUTPUT);
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(disp_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(disp_handle, true));  //turn the display on
 
+    //configure the display library
     const lvgl_port_cfg_t lvgl_config = {
         .task_priority = 5,
         .task_stack = 4096,
@@ -274,15 +281,17 @@ void init_Display(){
             .swap_bytes = false
         }
     };
-
+    //create a display within the the graphics library
     DISP_LCD = lvgl_port_add_disp(&disp_config);
 
+    // draw the initial text to the screen
     init_Label = lv_label_create(lv_screen_active());
     lv_label_set_text_fmt(init_Label,"Mode: %s\nTarget Flow Rate: %d%%\nCommanded Flow Rate: %d%%\n",mode_label[mode],target_spd,curr_spd);
     lv_obj_set_style_text_font(init_Label, &lv_font_montserrat_20, LV_PART_MAIN);
     lv_obj_set_pos(init_Label, 0, 0);
 }
 
+// initialize the PWM timer for controlling the motor
 void init_PWM(){
     ledc_timer_config_t PWM_timer = {
         .speed_mode = PWM_SPD_MODE,
@@ -305,14 +314,18 @@ void init_PWM(){
     ESP_ERROR_CHECK(ledc_channel_config(&PWM_channel));
 }
 
+// initialize the SD mounting on the board
 void init_DATA(){
+    //set variables for mounting SD card
     esp_err_t return_ERR;
     sdmmc_card_t *SD_card;
     const char mount_point[] = "/sdcard";
 
+    //define default hosting parameters
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT;
 
+    //configure SD with 1-pin writing (board is only wried for 1-pin)
     sdmmc_slot_config_t slot_config = {
         .clk = DATA_GPIO_CLK,
         .cmd = DATA_GPIO_CMD,
@@ -331,7 +344,7 @@ void init_DATA(){
 
     return_ERR = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &SD_card);
 
-    if(return_ERR != ESP_OK){
+    if(return_ERR != ESP_OK){   //if the system fails to mount the board, log it to the console
         ESP_LOGE(TAG,"Failed to mount filesystem: %s",esp_err_to_name(return_ERR));
         return;
     }
@@ -340,6 +353,7 @@ void init_DATA(){
     ESP_LOGI(TAG,"Successfully mounted filesystem");
 }
 
+// un-used function included for future implementation of a timer to allow for sub-tick timing measurements
 void init_TIMER(){
 
     // const esp_timer_create_args_t periodic_pwm_timer_args = {
@@ -354,134 +368,145 @@ void init_TIMER(){
     //TODO Later use this function for an actually timer and move creating the queue to the flow_TASK
 }
 
+// Logical function to covert a target speed (as motor %) into a duty cycle and update the timer
 void Speed2Duty(uint8_t x){
-    uint32_t d = 0;
-    float s = 0;
+    uint32_t d = 0; // duty as computed as an interger between 1 and 2^(timer bit resolution)
+    float s = 0;    //duty as a floating point percentage
     const uint32_t pwm_res = (1U << PWM_DUTY_RES); // 2^resolution
 
+    //limit the speed to be from 1 to 100
     if(x > 0 && x <= 100){      // TODO - ADD BETTER EDGE CASES
         s = ((((float)x/100)*0.72)+0.13);
         d = (uint32_t) ((((float)x/100*0.72)+0.13)*pwm_res);
     }
+    //write the calculated interger and float and commanded values to the console
     ESP_LOGI(TAG,"Writing Duty: %d, Calculated: %f, Input: %d",d,s,x);
-    if(curr_spd == 0 && x != 0){
+    if(curr_spd == 0 && x != 0){    //check to see if starting from stopped
+        //if stopped write the PWM high to wake the motor from standby
         ESP_ERROR_CHECK(ledc_set_duty(PWM_SPD_MODE,PWM_CH,pwm_res-1));
         ESP_ERROR_CHECK(ledc_update_duty(PWM_SPD_MODE,PWM_CH));
         vTaskDelay(pdMS_TO_TICKS(3));
     }
-    curr_spd = x;
+    curr_spd = x;   //update the previously set speed
+    //set the new duty cycle for controlling motor speed and update it
     ESP_ERROR_CHECK(ledc_set_duty(PWM_SPD_MODE,PWM_CH,d));
     ESP_ERROR_CHECK(ledc_update_duty(PWM_SPD_MODE,PWM_CH));
 }
 
+// logical function to parse the strings entered in the console
 void parse_cmd(char * cmd){
 
+    //echo back the recieved string
     ESP_LOGI(TAG,"Echo: %s",cmd);
 
+    //break the string into several tokens and grab the fist token
     char * tok = strtok(cmd," ");
-    if(tok != NULL){
-        if(strcmp(tok,"mode") == 0){ // command "MODE"
-            tok = strtok(NULL," ");
-            int modeN;
-            if(tok != NULL){
-                modeN = atoi(tok);
+    if(tok != NULL){    //if there is a first string after tokenizing
+        if(strcmp(tok,"mode") == 0){ // command "MODE", first string is "MODE"
+            tok = strtok(NULL," ");     //load next token from command
+            int modeN;              // int to store commanded mode
+            if(tok != NULL){            //if there is a second string after tokenizing
+                modeN = atoi(tok);  //parse the integer for the new mode
             } else {
-                modeN = 0;
+                modeN = 0;          //otherwise default to "Off" (which is 0)
             }
-            if (modeN < PWM_NUM_MODES && modeN >= 0){
+            if (modeN < PWM_NUM_MODES && modeN >= 0){   //if the entered integer mode is within the range of available modes
                 mode = modeN;
-                ESP_LOGI(TAG,"New Mode: %s",mode_label[mode]);
-                if(modeN == 0){
+                ESP_LOGI(TAG,"New Mode: %s",mode_label[mode]);  //display to console the mode update
+                if(modeN == 0){             //if mode is "Off" update duty cycle
                     target_spd = 0;
-                    Speed2Duty(target_spd);
+                    Speed2Duty(target_spd); //stop the PWM signal
                 }
-            } else {
+            } else {        //if the interger is outside the available modes, error to console invalid mode
                 ESP_LOGI(TAG,"Invalid Mode");
             }
 
-        } else if (strcmp(tok,"flow") == 0){ // command "FLOW"
-            tok = strtok(NULL," ");
-            int speedN;
-            if(tok != NULL){
-                speedN = atoi(tok);
-            } else {
-                speedN = 0;
+        } else if (strcmp(tok,"flow") == 0){ // command "FLOW", first string is "FLOW"
+            tok = strtok(NULL," "); //load next token from command
+            int speedN;         //int to store the new speed (as a int representing a % from 0 to 100)
+            if(tok != NULL){        //if there is a second string after tokenizing
+                speedN = atoi(tok);     //parse the new value
+            } else {    
+                speedN = 0;         //if no string set it to 0
             }
-            if (speedN <= MAX_FLOW && speedN >= 0){
+            if (speedN <= MAX_FLOW && speedN >= 0){     //if the enter speed is inside the allowed range
                 target_spd = speedN;
-                ESP_LOGI(TAG,"New Flow: %d",target_spd);
-                if(mode == 2){
-                    Speed2Duty(target_spd);
+                ESP_LOGI(TAG,"New Flow: %d",target_spd);    //log the new speed to console
+                if(mode == 2){      
+                    Speed2Duty(target_spd);         //set the speed if in "Manual" mode
                 }
             } else {
-                ESP_LOGI(TAG,"Invalid Flow Rate");
+                ESP_LOGI(TAG,"Invalid Flow Rate");  //otherwise, display error to console
             }
 
-        }else if(strcmp(tok,"data") == 0){ // command "DATA"
-            if(mountState){
-                tok = strtok(NULL," ");
-                int dataN;
-                if(tok != NULL){
-                    dataN = atoi(tok);
+        }else if(strcmp(tok,"data") == 0){ // command "DATA", first string is "DATA"
+            if(mountState){             //if the SD has been successfully mounted
+                tok = strtok(NULL," ");     //load next token from command
+                int dataN;                  //integer to store the new data mode
+                if(tok != NULL){        //if there is a second string after tokenizing
+                    dataN = atoi(tok);      //parse the new mode
                 } else {
-                    dataN = 0;
+                    dataN = 0;              //otherwise turn off data writing
                 }
-                if(dataN < DATA_NUM_MODES && dataN >=0){
-                    if(dataN != dataWrite){
+                if(dataN < DATA_NUM_MODES && dataN >=0){    //if the data mode is within the available data modes
+                    if(dataN != dataWrite){     //if the data mode changed
                         switch (dataN)
                         {
-                            case 0:
-                                fclose(f);
+                            case 0:             //"Off"
+                                fclose(f);  //close the data file
                                 break;
 
-                            case 1:
-                                f = fopen("/sdcard/test.txt","w");
+                            case 1:             //"On"
+                                f = fopen("/sdcard/test.txt","w");  //Open the data file
                                 if(f == NULL){
-                                    ESP_LOGE(TAG,"Failed to open data file");
+                                    ESP_LOGE(TAG,"Failed to open data file");   //if the file open failed go back to "off"
                                     dataN = 0;
                                 }
                                 break;
                             
-                            default:
+                            default:    //outside of 0 or 1 do nothing
                                 break;
                         }
-                        dataWrite = dataN;
+                        dataWrite = dataN;  //update teh set mode
                     }
-                    ESP_LOGI(TAG,"Data Write: %s",data_label[dataWrite]);
+                    ESP_LOGI(TAG,"Data Write: %s",data_label[dataWrite]);   //log the current data writing to console
                 }
-            } else {
+            } else {    // the file system doen't exist, print error to consile
                 ESP_LOGE(TAG,"No mounted file system for data saving");
             }
 
-        } else {        // OTHERWISE
+        } else {        // OTHERWISE print error to console
             ESP_LOGI(TAG,"Unrecognized Command: \"%s\"",tok);
         }
-    } else {
+    } else { //otherwise print error to console
         ESP_LOGI(TAG,"Unrecognized Command: \"%s\"",tok);
     }
 }
 
+// A function run in a task that periodically has events queued for it to read strings from the UART console
 void read_input_TASK(void * pntr){
 
-    uart_event_t input_event;
-    uint8_t input_data[UART_BUFF_SZ];
-    static char input_buff[256];
-    static int buff_index = 0;
+    //define variables to store the captured data
+    uart_event_t input_event;   //event for recieing uART data
+    uint8_t input_data[UART_BUFF_SZ];   //buffer to hold the UART data string from console
+    static char input_buff[256];        //buffer to hold the parsed data until it recieves a return/newline
+    static int buff_index = 0;          //index to point to the currently used size of input_buff
 
     while(true){
-        if(xQueueReceive(UART_event_q, (void *) &input_event, portMAX_DELAY)){
+        if(xQueueReceive(UART_event_q, (void *) &input_event, portMAX_DELAY)){  //when data is sent to the UART console
             switch(input_event.type){
-                case UART_DATA:
-                    int len = uart_read_bytes(UART_PORT, input_data, input_event.size, portMAX_DELAY);
-                    for(int i = 0; i < len; i++){
-                        char c = input_data[i];
+                case UART_DATA:     //check it is UART DATA
+                    int len = uart_read_bytes(UART_PORT, input_data, input_event.size, portMAX_DELAY);  //read the data from the event
+                    for(int i = 0; i < len; i++){   //for each character returned from the event
+                        char c = input_data[i];         //load the next character
+                        //if ((the buffer is full) OR (character is a newline) OR (character is a return)) AND (it is not the first character in the buffer)
                         if ((buff_index == sizeof(input_buff) - 1 || c == '\n' || c == '\r') && buff_index > 0){
-                            input_buff[buff_index] = '\0';
-                            parse_cmd(input_buff);
-                            buff_index = 0;
-                            break;
+                            input_buff[buff_index] = '\0';  //terminate the buffer string
+                            parse_cmd(input_buff);      //send the string to be parsed
+                            buff_index = 0;             //reset the buffer
+                            break;              //exit the loop
                         }
-                        else if (buff_index < sizeof(input_buff) - 1){
+                        else if (buff_index < sizeof(input_buff) - 1){  //otherwise append the leter toe the buffer and move to the next character
                             input_buff[buff_index++] = c;
                         }
                     }
@@ -493,27 +518,28 @@ void read_input_TASK(void * pntr){
     }
 }
 
+//a function to run in a task periodically to update what is shown on the digital display
 void update_disp_TASK(void * pntr){
     while(true){
-        uint8_t local_tSpd = target_spd;
+        uint8_t local_tSpd = target_spd;    //define local variables to store the speed so they only have to accessed once
         uint8_t local_cSpd = curr_spd;
         
-        portENTER_CRITICAL(&flow_spinlock);
+        portENTER_CRITICAL(&flow_spinlock); //prevent code from being interrupted while accessing the flow variables
         float local_flow = flowRate;
         float local_freq = flowFreq;
-        portEXIT_CRITICAL(&flow_spinlock);
-        lvgl_port_lock(0);
+        portEXIT_CRITICAL(&flow_spinlock);  //finish accessing the variables
+        lvgl_port_lock(0);              //lock access to the graphics library
         lv_label_set_text_fmt(init_Label,
             "Mode: %s\nData Write: %s\nTarget Motor Speed: %d%%\nCommanded Motor Speed: %d%%\n\nCurrent Flow Rate: %.2f\nCurrent Freq: %.2f",
-            mode_label[mode],data_label[dataWrite],local_tSpd,local_cSpd,local_flow,local_freq);
-        lvgl_port_unlock();
-        vTaskDelay(pdMS_TO_TICKS(1000));
+            mode_label[mode],data_label[dataWrite],local_tSpd,local_cSpd,local_flow,local_freq);    //write a string to the screen
+        lvgl_port_unlock();             //unlock the graphics library
+        vTaskDelay(pdMS_TO_TICKS(1000));    //update display once a second
     }
     // lv_obj_set_style_text_font(init_Label, &lv_font_montserrat_20, LV_PART_MAIN);
     // lv_obj_set_pos(init_Label, 0, 0);
 }
 
-/* Function flow_TASK()
+/* A function run in a task that periodically has events queued for it read the flow data and load it into a buffer for displaying to the console and saving to disk
     fr_pntr - void pointer the the typedef holding the buffers and control data for the flow meter*/
 void flow_TASK(void * fr_pntr){
 
@@ -546,46 +572,46 @@ void flow_TASK(void * fr_pntr){
             flow_time /= ((float)FLOW_BUFF_SIZE*1000.0);    //divide the sum by the total number of values
 
             //ESP_LOGI(TAG,"Running Flow: %f",flow_time);
-            if (flow_time > 0){
-                new_rate = 1.0/(flow_time*FLOW_K_VALUE);
+            if (flow_time > 0){                             //if the average is non-zero (no acutual data recorded)
+                new_rate = 1.0/(flow_time*FLOW_K_VALUE);        //compute flow rate and freq based on the reciprical of the average time
                 new_freq = 1.0/flow_time;
-            } else {
-                new_rate = 0;
+            } else {                                        // Otherwise
+                new_rate = 0;                                   //set the recorded values to zero
                 new_freq = 0;
             }
-        } else {    //ON TIMEOUT
-            new_rate = 0;
+        } else {                                //ON TIMEOUT (if the queue waits too long for a new element)
+            new_rate = 0;                           //set the recorded values to zero and time stamp the timeout
             new_freq = 0;
             isr_time.timestamp = xTaskGetTickCount();
         }
-        local_meter->buffRate[*local_Idx] = new_rate;
+        local_meter->buffRate[*local_Idx] = new_rate;       //Store the values in the data buffer
         local_meter->buffFreq[*local_Idx] = new_freq;
         local_meter->buffTimestamp[*local_Idx] = isr_time.timestamp;
-        *local_Idx = (*local_Idx)+1;
-        if(*local_Idx > FLOW_OUTPUT_BUFF_SIZE){
-            ESP_LOGW(TAG,"FLOW OUTPUT OVERFLOW!");
+        *local_Idx = (*local_Idx)+1;                        //move the buffer index to the next position
+        if(*local_Idx > FLOW_OUTPUT_BUFF_SIZE){             //if the index reaches the end of the buffer
+            ESP_LOGW(TAG,"FLOW OUTPUT OVERFLOW!");              //overflow to the beginning of the buffer and display a warning (this would require the flow meter to read faster than its max flowrate)
             *local_Idx = *local_Idx % FLOW_OUTPUT_BUFF_SIZE;
         }
-        local_tNow = xTaskGetTickCount();
-        if((local_tNow-local_tLast) > pdMS_TO_TICKS(FLOW_OUTPUT_PERIOD_MS)){
-            ESP_LOGI(TAG,"TS %lu",local_tNow);
-            #if SERIAL_OUTPUT
-                char OUT_STR[26*FLOW_OUTPUT_BUFF_SIZE+1] = "\0";
-                char LOOP_STR[26] = "\0";
-                for(int i = 0; i < *local_Idx; i++){
+        local_tNow = xTaskGetTickCount();                   //get the current time
+        if((local_tNow-local_tLast) > pdMS_TO_TICKS(FLOW_OUTPUT_PERIOD_MS)){        //if it has been longer that the display period
+            ESP_LOGI(TAG,"TS %lu",local_tNow);              //display the current tick
+            #if SERIAL_OUTPUT                           //if the serial display is enabled
+                char OUT_STR[26*FLOW_OUTPUT_BUFF_SIZE+1] = "\0";    //A string that holds the entire list of data to be ouutput/saved
+                char LOOP_STR[26] = "\0";                           //A string to hold individual buffer element data in string form to be later concatonated
+                for(int i = 0; i < *local_Idx; i++){        //loop through each element in the buffer, convert to string data and concatenate them together
                     sprintf(LOOP_STR,"/*%3.2f, %3.2f, %3lu*/\n",local_meter->buffRate[i],local_meter->buffFreq[i],local_meter->buffTimestamp[i]);
                     strcat(OUT_STR,LOOP_STR);
                 }
-                ESP_LOGI(TAG,"%s",OUT_STR);
+                ESP_LOGI(TAG,"%s",OUT_STR);     //log the created string to console
+                if(dataWrite == 1){             //if the data writing is active
+                    fprintf(f,"%s",OUT_STR);        //print it to the file
+                }
             #endif
-            if(dataWrite == 1){
-                fprintf(f,"%s",OUT_STR);
-            }
-            *local_Idx = 0;
-            portENTER_CRITICAL(&flow_spinlock);
-            *pRate = new_rate;
+            *local_Idx = 0;                     //reset the buffer position
+            portENTER_CRITICAL(&flow_spinlock); //prevent code from being interrupted while setting flow variables
+            *pRate = new_rate;                      //set values through the pointers
             *pFreq = new_freq;
-            portEXIT_CRITICAL(&flow_spinlock);
+            portEXIT_CRITICAL(&flow_spinlock);  //exit seting flow variables
             local_tLast = xTaskGetTickCount();
         }
     }
@@ -608,21 +634,24 @@ void heartbeat_TASK(void * pntr){
 
 void app_main(void){
 
-    esp_log_level_set("*", ESP_LOG_DEBUG);        // Everything
+    esp_log_level_set("*", ESP_LOG_DEBUG);        // Everything is logged in debug
     esp_log_level_set("spi_master", ESP_LOG_DEBUG);
     esp_log_level_set("lcd_panel.io.spi", ESP_LOG_DEBUG);
 
+    //one time set up code
     init_UART();
     init_GPIO();
     init_Display();
     init_PWM();
     init_DATA();
 
+    //task that will fire periodically or on queued events
     xTaskCreate(read_input_TASK,"Read Input",4096,NULL,6,NULL);
     xTaskCreate(heartbeat_TASK,"LED Pulse",4096,NULL,3,NULL);
     xTaskCreate(update_disp_TASK,"LCD Display",4096,NULL,3,NULL);
     xTaskCreate(flow_TASK,"Calculate Flow",4096,(void*)&flow_meter,4,NULL);
 
+    //log on startup
     ESP_LOGI(TAG,"Starting Echo Chamber . . .\n");
 
 }

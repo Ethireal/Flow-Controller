@@ -4,8 +4,9 @@ The pump is controlled by sending information to the controller via a usb UART (
 Feedback from the controller is also sent over this connection to be displayed in the console.
 
 A basic set of commands was implemented to control basic functionality of the pump; specifically ON/OFF and the speed of the pump
-    - MODE was chosen for switching operation on and off    ("MODE 0" for OFF, "MODE 2" for ON)
-    - FLOW was chosen for setting the pump speed as a %     ("FLOW %" where % is an integer from 0-100)
+    - MODE was chosen for switching operation on and off    ("mode 0" for OFF, "mode 2" for ON)
+    - FLOW was chosen for setting the pump speed as a %     ("flow %" where % is an integer from 0-100)
+    - DATA was chosen for turning on/off write to file      ("data 0" no write, "data 1" for data write)
 
 These controls interact with the GPIO pins of the controller to send a PWM signal to the pump that reflects the target operation.
 
