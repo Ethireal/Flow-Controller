@@ -18,7 +18,7 @@ The system also contains a flow sensor that sends a PWM signal back to the contr
 
 The pump's PWM signal is created with the LEDC component of the ESP-IDF. This component is designed to modulate the brightness of LED's with a PWM signal, but the PWM creation can also be used for generating other PWM signals as long as the characteristics of the PWM signal is relatively straight forward. As the selected pump [Pierburg "CWA400" (PWM version)] can operates based on the duty cycle of the PWM signal and accepts a frequency from 50 - 1000 Hz, the pump can be controlled with a constant frequency and just varying the duty cycle.
 
-The pump operation based on the inputted dudty cycle is specified as follows;
+The pump operation, based on the inputted duty cycle, is specified as follows;
     - [ 0 -   1%] -> Stop
     - [ 1 -   7%] -> Emergency running (95%)
     - [ 8 -  12%] -> Not implemented
