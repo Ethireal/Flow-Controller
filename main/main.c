@@ -380,7 +380,7 @@ void Speed2Duty(uint8_t x){
         d = (uint32_t) ((((float)x/100*0.72)+0.13)*pwm_res);
     }
     //write the calculated interger and float and commanded values to the console
-    ESP_LOGI(TAG,"Writing Duty: %d, Calculated: %f, Input: %d",d,s,x);
+    ESP_LOGI(TAG,"Writing Duty: %lu, Calculated: %f, Input: %d",d,s,x);
     if(curr_spd == 0 && x != 0){    //check to see if starting from stopped
         //if stopped write the PWM high to wake the motor from standby
         ESP_ERROR_CHECK(ledc_set_duty(PWM_SPD_MODE,PWM_CH,pwm_res-1));
