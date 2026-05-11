@@ -63,9 +63,10 @@
 #define FLOW_BUFF_SIZE 20
 #define FLOW_OUTPUT_BUFF_SIZE 20
 #define FLOW_OUTPUT_PERIOD_MS 200
-#define FLOW_DEFAULT_BUFFER_VAL pdMS_TO_TICKS(1200) //UINT32_MAX
+#define FLOW_DEFAULT_BUFFER_VAL 0
 #define FLOW_DEBOUNCE 5
-#define FLOW_K_VALUE 0.26
+#define FLOW_DEBOUNCE_US 5000   // 5 ms debounce in microseconds
+#define FLOW_K_VALUE 0.21
 #define FLOW_PULSE_TIMEOUT 1000
 
 // <<-- DATA SAVING DEFINITIONS -->>
@@ -79,6 +80,7 @@
 
 // <<-- SERIAL STUDIO OUTPUT DEFINITIONS -->>
 #define SERIAL_OUTPUT 1
+#define CSV_OUTPUT 1
 
 // <<-- CUSTOM TYPEDEFS -->>
 
@@ -88,13 +90,14 @@ typedef struct  {
     int buffIdx;
     float buffRate[FLOW_OUTPUT_BUFF_SIZE];
     float buffFreq[FLOW_OUTPUT_BUFF_SIZE];
-    volatile TickType_t buffTimestamp[FLOW_OUTPUT_BUFF_SIZE];
-    volatile TickType_t flowTicks[FLOW_BUFF_SIZE];
+    float buffInstFreq[FLOW_OUTPUT_BUFF_SIZE];
+    volatile int64_t buffTimestamp[FLOW_OUTPUT_BUFF_SIZE];
+    volatile int64_t flowTicks[FLOW_BUFF_SIZE];
 } flow_data_t;
 
 typedef struct {
-    volatile TickType_t period;
-    volatile TickType_t timestamp;
+    volatile int64_t period_us;
+    volatile int64_t timestamp_us;
 } isr_time_data_t;
 
 // GLOBAL VARIABLES - GENERAL
@@ -104,7 +107,7 @@ static const char *TAG = "PumpCtrl";
 static QueueHandle_t UART_event_q = NULL;
 
 // GLOBAL VARIABLES - FLOW
-static volatile DRAM_ATTR TickType_t flow_last_tick = 0;
+static volatile DRAM_ATTR int64_t flow_last_us = 0;
 //static volatile TickType_t flow_buff[FLOW_BUFF_SIZE];
 static volatile uint8_t flow_tar = 0;
 static volatile float flowRate = 0;
@@ -142,16 +145,15 @@ esp_timer_handle_t auto_pwm_timer = NULL;
  *      Function is attached within init_GPIO
 */
 void IRAM_ATTR flow_meter_isr(void * args){
-    //use the internal esp tick count to determine time betweeen interrupts
-    TickType_t local_now_tick = xTaskGetTickCountFromISR();
-    TickType_t isr_new_period = local_now_tick-flow_last_tick;
-    if(pdTICKS_TO_MS(isr_new_period) > FLOW_DEBOUNCE){  // include a software debounce for pulses faster that flow meter can read
-        flow_last_tick = local_now_tick;    //update clast interrupt trigger
-        isr_time_data_t isr_new_time = {    //package the period and local timestamp
-            .period = isr_new_period,
-            .timestamp = local_now_tick
+    int64_t now_us = esp_timer_get_time();
+    int64_t new_period_us = now_us - flow_last_us;
+    if (new_period_us > FLOW_DEBOUNCE_US) {             //software debounce: ignore pulses closer than 5 ms
+        flow_last_us = now_us;
+        isr_time_data_t pkt = {
+            .period_us = new_period_us,
+            .timestamp_us = now_us
         };
-        xQueueSendFromISR(flow_event_q,&isr_new_time,NULL); //send the packaged data to a queue to be processes outside the ISR
+        xQueueSendFromISR(flow_event_q, &pkt, NULL);
     }
 }
 
@@ -462,6 +464,11 @@ void parse_cmd(char * cmd){
                                     ESP_LOGE(TAG,"Failed to open data file");   //if the file open failed go back to "off"
                                     dataN = 0;
                                 }
+                                #if CSV_OUTPUT
+                                else {
+                                    fprintf(f, "timestamp_us,instant_freq_hz,filtered_freq_hz,filtered_lpm,pump_duty_cmd\n");
+                                }
+                                #endif
                                 break;
                             
                             default:    //outside of 0 or 1 do nothing
@@ -546,30 +553,38 @@ void flow_TASK(void * fr_pntr){
     flow_data_t* local_meter = (flow_data_t*) fr_pntr;          //dereference the void pointer to access the values within the typedef
     volatile float* pRate = local_meter->pntrRate;              //create a local pointer to the rate value for display
     volatile float* pFreq = local_meter->pntrFreq;              //create a local pointer to the freqency value for display
-    volatile TickType_t* flow_buff = local_meter->flowTicks;    //create a local pointer to the buffer that holds the tick values returned by the ISR
+    volatile int64_t* flow_buff = local_meter->flowTicks;       //create a local pointer to the buffer that holds the period values (µs) returned by the ISR
     for(int i = 0; i < FLOW_BUFF_SIZE;i++){
         flow_buff[i] = FLOW_DEFAULT_BUFFER_VAL;                 //Iterate thru the buffer and initiallize all the values to ignore irregular initial values
     }
 
     isr_time_data_t isr_time = {
-        .period = 0,
-        .timestamp = 0,
+        .period_us = 0,
+        .timestamp_us = 0,
     };                                                          //define a typedef to hold the recieved period and timestamp from the ISR
     TickType_t local_tNow = 0;                                  //define a local value for current tick count
     TickType_t local_tLast = xTaskGetTickCount();               //define a second local value for tick count to compare the last one to
     int* local_Idx = &(local_meter->buffIdx);                   //define a local pointer for the number of new measurements within the buffer
     float new_rate;                                             //define a local value to hold calculated rate
     float new_freq;                                             //define a local value to hold calculated frequency
+    float inst_freq;                                            //define a local value to hold instantaneous frequency from single pulse
 
     while(true){        // << -- ENTER FREE-RUNNING LOOP -- >>
         if(xQueueReceive(flow_event_q,&isr_time,pdMS_TO_TICKS(FLOW_PULSE_TIMEOUT))){    //Tell the loop to defer execution until the flow_event_q receives a value (from the flow ISR) or it hits its timeout value
-            flow_buff[flow_tar++] = isr_time.period;        //add the period sent from ISR into the buffer of values
+            flow_buff[flow_tar++] = isr_time.period_us;     //add the period (µs) sent from ISR into the buffer of values
             flow_tar %= FLOW_BUFF_SIZE;                     //move to the next pointiton in the buffer, at the end loop back over the preivous entries
+            inst_freq = (isr_time.period_us > 0) ? (1e6f / (float)isr_time.period_us) : 0.0f;
             float flow_time = 0;                            //float to hold the mean period of all values in the buffer flow_buff
+            int flow_count = 0;
             for(int i = 0; i < FLOW_BUFF_SIZE;i++){
-                flow_time += pdTICKS_TO_MS(flow_buff[i]);   //interate thru every value in the buffer and add them
+                if(flow_buff[i] != 0){
+                    flow_time += (float)flow_buff[i];           //sum non-zero periods in microseconds
+                    flow_count++;
+                }
             }
-            flow_time /= ((float)FLOW_BUFF_SIZE*1000.0);    //divide the sum by the total number of values
+            if(flow_count > 0){
+                flow_time /= ((float)flow_count * 1e6f);        //divide by count and convert µs → seconds
+            }
 
             //ESP_LOGI(TAG,"Running Flow: %f",flow_time);
             if (flow_time > 0){                             //if the average is non-zero (no acutual data recorded)
@@ -582,13 +597,15 @@ void flow_TASK(void * fr_pntr){
         } else {                                //ON TIMEOUT (if the queue waits too long for a new element)
             new_rate = 0;                           //set the recorded values to zero and time stamp the timeout
             new_freq = 0;
-            isr_time.timestamp = xTaskGetTickCount();
+            inst_freq = 0.0f;
+            isr_time.timestamp_us = esp_timer_get_time();
         }
         local_meter->buffRate[*local_Idx] = new_rate;       //Store the values in the data buffer
         local_meter->buffFreq[*local_Idx] = new_freq;
-        local_meter->buffTimestamp[*local_Idx] = isr_time.timestamp;
+        local_meter->buffInstFreq[*local_Idx] = inst_freq;
+        local_meter->buffTimestamp[*local_Idx] = isr_time.timestamp_us;
         *local_Idx = (*local_Idx)+1;                        //move the buffer index to the next position
-        if(*local_Idx > FLOW_OUTPUT_BUFF_SIZE){             //if the index reaches the end of the buffer
+        if(*local_Idx >= FLOW_OUTPUT_BUFF_SIZE){            //if the index reaches the end of the buffer
             ESP_LOGW(TAG,"FLOW OUTPUT OVERFLOW!");              //overflow to the beginning of the buffer and display a warning (this would require the flow meter to read faster than its max flowrate)
             *local_Idx = *local_Idx % FLOW_OUTPUT_BUFF_SIZE;
         }
@@ -596,15 +613,27 @@ void flow_TASK(void * fr_pntr){
         if((local_tNow-local_tLast) > pdMS_TO_TICKS(FLOW_OUTPUT_PERIOD_MS)){        //if it has been longer that the display period
             ESP_LOGI(TAG,"TS %lu",local_tNow);              //display the current tick
             #if SERIAL_OUTPUT                           //if the serial display is enabled
-                char OUT_STR[26*FLOW_OUTPUT_BUFF_SIZE+1] = "\0";    //A string that holds the entire list of data to be ouutput/saved
-                char LOOP_STR[26] = "\0";                           //A string to hold individual buffer element data in string form to be later concatonated
+                char OUT_STR[48*FLOW_OUTPUT_BUFF_SIZE+1] = "\0";    //A string that holds the entire list of data to be ouutput/saved
+                char LOOP_STR[48] = "\0";                           //A string to hold individual buffer element data in string form to be later concatonated
                 for(int i = 0; i < *local_Idx; i++){        //loop through each element in the buffer, convert to string data and concatenate them together
-                    sprintf(LOOP_STR,"/*%3.2f, %3.2f, %3lu*/\n",local_meter->buffRate[i],local_meter->buffFreq[i],local_meter->buffTimestamp[i]);
+                    sprintf(LOOP_STR,"/*%3.2f, %3.2f, %lld*/\n",local_meter->buffRate[i],local_meter->buffFreq[i],(long long)local_meter->buffTimestamp[i]);
                     strcat(OUT_STR,LOOP_STR);
                 }
                 ESP_LOGI(TAG,"%s",OUT_STR);     //log the created string to console
                 if(dataWrite == 1){             //if the data writing is active
                     fprintf(f,"%s",OUT_STR);        //print it to the file
+                }
+            #endif
+            #if CSV_OUTPUT
+                if(dataWrite == 1){
+                    for(int i = 0; i < *local_Idx; i++){
+                        fprintf(f, "%lld,%.4f,%.4f,%.4f,%d\n",
+                            (long long)local_meter->buffTimestamp[i],
+                            local_meter->buffInstFreq[i],
+                            local_meter->buffFreq[i],
+                            local_meter->buffRate[i],
+                            (int)curr_spd);
+                    }
                 }
             #endif
             *local_Idx = 0;                     //reset the buffer position
