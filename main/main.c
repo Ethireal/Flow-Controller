@@ -287,10 +287,12 @@ void init_Display(){
     DISP_LCD = lvgl_port_add_disp(&disp_config);
 
     // draw the initial text to the screen
+    lvgl_port_lock(0);
     init_Label = lv_label_create(lv_screen_active());
     lv_label_set_text_fmt(init_Label,"Mode: %s\nTarget Flow Rate: %d%%\nCommanded Flow Rate: %d%%\n",mode_label[mode],target_spd,curr_spd);
     lv_obj_set_style_text_font(init_Label, &lv_font_montserrat_20, LV_PART_MAIN);
     lv_obj_set_pos(init_Label, 0, 0);
+    lvgl_port_unlock();
 }
 
 // initialize the PWM timer for controlling the motor
@@ -387,7 +389,7 @@ void Speed2Duty(uint8_t x){
         //if stopped write the PWM high to wake the motor from standby
         ESP_ERROR_CHECK(ledc_set_duty(PWM_SPD_MODE,PWM_CH,pwm_res-1));
         ESP_ERROR_CHECK(ledc_update_duty(PWM_SPD_MODE,PWM_CH));
-        vTaskDelay(pdMS_TO_TICKS(3));
+        vTaskDelay(pdMS_TO_TICKS(500));  //wait 500 ms to ensure the motor is awake before setting the new duty cycle, 500 needs to be dialed in
     }
     curr_spd = x;   //update the previously set speed
     //set the new duty cycle for controlling motor speed and update it
@@ -459,22 +461,41 @@ void parse_cmd(char * cmd){
                                 break;
 
                             case 1:             //"On"
-                                f = fopen("/sdcard/test.txt","w");  //Open the data file
-                                if(f == NULL){
-                                    ESP_LOGE(TAG,"Failed to open data file");   //if the file open failed go back to "off"
+                            {
+                                // Grab the next token as the filename. If missing, reject with an error.
+                                char * fname_tok = strtok(NULL, " ");
+                                if (fname_tok == NULL) {
+                                    ESP_LOGE(TAG, "Filename required: use 'data 1 <name>' (e.g., 'data 1 cal_05pct_run1')");
+                                    dataN = 0;
+                                    break;
+                                }
+                                // Reject names with path separators or whitespace
+                                if (strchr(fname_tok, '/') || strchr(fname_tok, '\\')) {
+                                    ESP_LOGE(TAG, "Invalid filename: no '/' or '\\' allowed");
+                                    dataN = 0;
+                                    break;
+                                }
+                                // Build the full path
+                                char path[80];
+                                snprintf(path, sizeof(path), "/sdcard/%s.txt", fname_tok);
+                                f = fopen(path, "w");   // "w" overwrites; each session is a fresh file
+                                if (f == NULL) {
+                                    ESP_LOGE(TAG, "Failed to open data file: %s", path);
                                     dataN = 0;
                                 }
                                 #if CSV_OUTPUT
                                 else {
-                                    fprintf(f, "timestamp_us,instant_freq_hz,filtered_freq_hz,filtered_lpm,pump_duty_cmd\n");
+                                    fprintf(f, "timestamp_us,elapsed_s,instant_freq_hz,filtered_freq_hz,filtered_lpm,pump_duty_cmd\n");
+                                    ESP_LOGI(TAG, "Logging to: %s", path);
                                 }
                                 #endif
                                 break;
+                            }
                             
                             default:    //outside of 0 or 1 do nothing
                                 break;
                         }
-                        dataWrite = dataN;  //update teh set mode
+                        dataWrite = dataN;  //update the set mode
                     }
                     ESP_LOGI(TAG,"Data Write: %s",data_label[dataWrite]);   //log the current data writing to console
                 }
@@ -495,7 +516,7 @@ void read_input_TASK(void * pntr){
 
     //define variables to store the captured data
     uart_event_t input_event;   //event for recieing uART data
-    uint8_t input_data[UART_BUFF_SZ];   //buffer to hold the UART data string from console
+    static uint8_t input_data[UART_BUFF_SZ];   //buffer to hold the UART data string from console
     static char input_buff[256];        //buffer to hold the parsed data until it recieves a return/newline
     static int buff_index = 0;          //index to point to the currently used size of input_buff
 
@@ -613,22 +634,24 @@ void flow_TASK(void * fr_pntr){
         if((local_tNow-local_tLast) > pdMS_TO_TICKS(FLOW_OUTPUT_PERIOD_MS)){        //if it has been longer that the display period
             ESP_LOGI(TAG,"TS %lu",local_tNow);              //display the current tick
             #if SERIAL_OUTPUT                           //if the serial display is enabled
-                char OUT_STR[48*FLOW_OUTPUT_BUFF_SIZE+1] = "\0";    //A string that holds the entire list of data to be ouutput/saved
-                char LOOP_STR[48] = "\0";                           //A string to hold individual buffer element data in string form to be later concatonated
+                static char OUT_STR[48*FLOW_OUTPUT_BUFF_SIZE+1] = "\0";    //A string that holds the entire list of data to be ouutput/saved
+                static char LOOP_STR[48] = "\0";                           //A string to hold individual buffer element data in string form to be later concatonated
+                OUT_STR[0] = '\0';    //reset the output string
+                LOOP_STR[0] = '\0';    //reset the loop string
+                
                 for(int i = 0; i < *local_Idx; i++){        //loop through each element in the buffer, convert to string data and concatenate them together
-                    sprintf(LOOP_STR,"/*%3.2f, %3.2f, %lld*/\n",local_meter->buffRate[i],local_meter->buffFreq[i],(long long)local_meter->buffTimestamp[i]);
+                    sprintf(LOOP_STR,"/*%3.2f, %3.2f, %.3f*/\n",local_meter->buffRate[i],local_meter->buffFreq[i],(double)local_meter->buffTimestamp[i] / 1e6);
                     strcat(OUT_STR,LOOP_STR);
                 }
                 ESP_LOGI(TAG,"%s",OUT_STR);     //log the created string to console
-                if(dataWrite == 1){             //if the data writing is active
-                    fprintf(f,"%s",OUT_STR);        //print it to the file
-                }
+
             #endif
             #if CSV_OUTPUT
                 if(dataWrite == 1){
                     for(int i = 0; i < *local_Idx; i++){
-                        fprintf(f, "%lld,%.4f,%.4f,%.4f,%d\n",
+                        fprintf(f, "%lld,%.3f,%.4f,%.4f,%.4f,%d\n",
                             (long long)local_meter->buffTimestamp[i],
+                            (double)local_meter->buffTimestamp[i] / 1e6,
                             local_meter->buffInstFreq[i],
                             local_meter->buffFreq[i],
                             local_meter->buffRate[i],
@@ -675,7 +698,7 @@ void app_main(void){
     init_DATA();
 
     //task that will fire periodically or on queued events
-    xTaskCreate(read_input_TASK,"Read Input",4096,NULL,6,NULL);
+    xTaskCreate(read_input_TASK,"Read Input",8192,NULL,6,NULL);
     xTaskCreate(heartbeat_TASK,"LED Pulse",4096,NULL,3,NULL);
     xTaskCreate(update_disp_TASK,"LCD Display",4096,NULL,3,NULL);
     xTaskCreate(flow_TASK,"Calculate Flow",4096,(void*)&flow_meter,4,NULL);
